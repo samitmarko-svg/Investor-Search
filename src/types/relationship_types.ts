@@ -75,8 +75,11 @@ export interface RelationshipAlignment {
 export interface RelationshipEvent {
   id: string;
   relationship_id: string;
-  event_type: 'SNAPSHOT_SUBMITTED' | 'TRIGGER_HIT' | 'ALIGNMENT_UPDATED';
+  event_type: string;
+  event_category: 'LIFECYCLE' | 'BEHAVIORAL' | 'INTEGRITY' | 'PATTERN';
   event_data: Record<string, unknown>;
+  severity: 'INFO' | 'WARNING' | 'CRITICAL';
+  occurred_at: Date;
   created_at: Date;
 }
 
@@ -85,6 +88,113 @@ export interface ConversationTrigger {
   trigger_condition: string;
   triggered_at?: Date;
   resolved_at?: Date;
+}
+
+// ============================================
+// Temporal Pattern Types
+// ============================================
+
+export interface TemporalPattern {
+  id: string;
+  relationship_id: string;
+  snapshot_id: string;
+
+  volatility_score: number | null;
+  volatility_classification: 'STABLE' | 'MODERATE' | 'HIGH' | 'EXTREME' | null;
+  volatility_by_metric: Record<string, MetricVolatility>;
+
+  recovery_detected: boolean;
+  recovery_speed_days: number | null;
+  recovery_magnitude: number | null;
+  recovery_events: RecoveryEvent[];
+
+  trajectory_direction: 'GROWTH' | 'DECLINE' | 'STABLE' | 'VOLATILE' | null;
+  trajectory_slope: number | null;
+  trajectory_r_squared: number | null;
+
+  cadence_mean_interval: number | null;
+  cadence_variance: number | null;
+  cadence_regularity: 'HIGH' | 'MODERATE' | 'LOW' | null;
+
+  analyzed_at: Date;
+  analysis_version: string;
+}
+
+export interface MetricVolatility {
+  score: number;
+  mean: number;
+  std_dev: number;
+  classification: string;
+  reason?: string;
+}
+
+export interface RecoveryEvent {
+  metric: string;
+  drop_magnitude: number;
+  recovery_magnitude: number;
+  recovery_days: number;
+}
+
+// ============================================
+// Alert Types
+// ============================================
+
+export interface RelationshipAlert {
+  id: string;
+  relationship_id: string;
+  event_id: string | null;
+  alert_type: string;
+  severity: 'INFO' | 'WARNING' | 'CRITICAL';
+  title: string;
+  description: string;
+  visibility: 'BOTH_PARTIES' | 'FOUNDER_ONLY' | 'INVESTOR_ONLY';
+  status: 'ACTIVE' | 'ACKNOWLEDGED' | 'RESOLVED';
+  created_at: Date;
+  acknowledged_at: Date | null;
+  resolved_at: Date | null;
+}
+
+// ============================================
+// Temporal Signal Types
+// ============================================
+
+export interface TemporalSignals {
+  entropy: number | null;
+  stability: number | null;
+  decay_rate: number;
+  recovery_capacity: number;
+}
+
+// ============================================
+// Validation Types
+// ============================================
+
+export interface ValidationError {
+  field: string;
+  error: string;
+  message: string;
+  severity?: 'ERROR' | 'WARNING' | 'INFO';
+}
+
+export interface ValidationResult {
+  is_valid: boolean;
+  errors: ValidationError[];
+  warnings: ValidationError[];
+}
+
+// ============================================
+// Pipeline Types
+// ============================================
+
+export type SnapshotStatus = 'PROCESSING' | 'PROCESSED' | 'FAILED';
+
+export interface PipelineResult {
+  snapshot_id: string;
+  status: SnapshotStatus;
+  integrity_score?: IntegrityScore;
+  temporal_pattern?: TemporalPattern;
+  events_emitted: string[];
+  error?: string;
 }
 
 // ============================================
