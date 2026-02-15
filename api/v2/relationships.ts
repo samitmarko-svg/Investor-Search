@@ -2,7 +2,8 @@
  * API v2: Relationships Endpoints
  *
  * Relationship-scoped endpoints for managing relationships, snapshots,
- * and integrity scores.
+ * and integrity scores. Now with async pipeline, validation, permissions,
+ * and event propagation.
  */
 
 import { Router, Request, Response } from 'express';
@@ -12,12 +13,22 @@ import {
   getRelationshipType,
   validateSnapshotData,
 } from '../../src/types/relationship_types';
-import { activateRelationship, createSnapshot } from '../../src/guardrails/snapshot_first';
+import { activateRelationship } from '../../src/guardrails/snapshot_first';
 import { preventMarketplaceEndpoints } from '../../src/guardrails/crm_drift';
-import { calculateIntegrityForType } from '../../src/integrity/calculator';
+import { SnapshotPipeline, ValidationFailedError } from '../../src/pipeline/processor';
+import { EventPropagator } from '../../src/events/propagation';
+import {
+  authenticate,
+  requireRelationshipAccess,
+  requireSnapshotSubmissionRights,
+  AuthenticatedRequest,
+} from '../../src/middleware/permissions';
+import { createAuditMiddleware } from '../../src/middleware/audit';
 
 export function createRelationshipRouter(db: Pool): Router {
   const router = Router();
+  const pipeline = new SnapshotPipeline(db);
+  const eventPropagator = new EventPropagator(db);
 
   // Guardrail middleware: prevent marketplace endpoints
   router.use((req, _res, next) => {
@@ -29,6 +40,9 @@ export function createRelationshipRouter(db: Pool): Router {
       _res.status(400).json({ error: message });
     }
   });
+
+  // Audit logging for all data-modifying requests
+  router.use(createAuditMiddleware(db));
 
   // ============================================
   // POST /api/v2/relationships
@@ -88,6 +102,13 @@ export function createRelationshipRouter(db: Pool): Router {
         [entity_a_id, entity_b_id, relType.roles.a, relType.roles.b, relationship_type, JSON.stringify(metadata || {})]
       );
 
+      // Emit lifecycle event
+      await eventPropagator.emitAndPropagate(
+        result.rows[0].id,
+        'intent_expressed',
+        { entity_a_id, entity_b_id, relationship_type }
+      );
+
       return res.status(201).json(result.rows[0]);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Internal server error';
@@ -137,6 +158,13 @@ export function createRelationshipRouter(db: Pool): Router {
       if (status === 'ACTIVE') {
         // Enforces snapshot-first rule
         await activateRelationship(db, req.params.id);
+
+        await eventPropagator.emitAndPropagate(
+          req.params.id,
+          'relationship_activated',
+          { activated_by: (req as AuthenticatedRequest).userId }
+        );
+
         return res.json({ message: 'Relationship activated' });
       }
 
@@ -147,6 +175,14 @@ export function createRelationshipRouter(db: Pool): Router {
            WHERE id = $1 AND deleted_at IS NULL`,
           [req.params.id]
         );
+
+        await eventPropagator.emitAndPropagate(
+          req.params.id,
+          'state_transition',
+          { from_state: 'ACTIVE', to_state: 'TERMINATED' },
+          'CRITICAL'
+        );
+
         return res.json({ message: 'Relationship terminated' });
       }
 
@@ -167,7 +203,7 @@ export function createRelationshipRouter(db: Pool): Router {
 
   // ============================================
   // POST /api/v2/relationships/:id/snapshots
-  // Submit a snapshot for a relationship
+  // Submit a snapshot for async processing (returns 202)
   // ============================================
   router.post('/:id/snapshots', async (req: Request, res: Response) => {
     try {
@@ -204,15 +240,54 @@ export function createRelationshipRouter(db: Pool): Router {
         });
       }
 
-      // Create snapshot (integrity score calculated automatically)
-      const snapshot = await createSnapshot(db, req.params.id, {
-        snapshot_date: new Date(snapshot_date),
-        declarations,
-        financials,
-        context_notes,
-      });
+      // Submit to async pipeline
+      const result = await pipeline.submit(
+        req.params.id,
+        {
+          snapshot_date: new Date(snapshot_date),
+          declarations,
+          financials,
+          context_notes,
+        },
+        (req as AuthenticatedRequest).submittingEntityId
+      );
 
-      return res.status(201).json(snapshot);
+      return res.status(202).json({
+        id: result.id,
+        status: result.status,
+        message: 'Snapshot queued for processing',
+      });
+    } catch (err) {
+      if (err instanceof ValidationFailedError) {
+        return res.status(400).json({
+          error: 'Snapshot validation failed',
+          details: err.errors,
+        });
+      }
+
+      const message = err instanceof Error ? err.message : 'Internal server error';
+      return res.status(500).json({ error: message });
+    }
+  });
+
+  // ============================================
+  // GET /api/v2/relationships/:id/snapshots/:snapshotId/status
+  // Get snapshot processing status
+  // ============================================
+  router.get('/:id/snapshots/:snapshotId/status', async (req: Request, res: Response) => {
+    try {
+      const result = await db.query(
+        `SELECT id, status, processed_at, error_message, created_at
+         FROM snapshots
+         WHERE id = $1 AND relationship_id = $2`,
+        [req.params.snapshotId, req.params.id]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'Snapshot not found' });
+      }
+
+      return res.json(result.rows[0]);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Internal server error';
       return res.status(500).json({ error: message });
@@ -238,6 +313,127 @@ export function createRelationshipRouter(db: Pool): Router {
         scores: result.rows,
         latest: result.rows[0] || null,
       });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Internal server error';
+      return res.status(500).json({ error: message });
+    }
+  });
+
+  // ============================================
+  // GET /api/v2/relationships/:id/temporal
+  // Get temporal patterns for a relationship
+  // ============================================
+  router.get('/:id/temporal', async (req: Request, res: Response) => {
+    try {
+      const result = await db.query(
+        `SELECT * FROM temporal_patterns
+         WHERE relationship_id = $1
+         ORDER BY analyzed_at DESC
+         LIMIT 10`,
+        [req.params.id]
+      );
+
+      return res.json({
+        relationship_id: req.params.id,
+        patterns: result.rows,
+        latest: result.rows[0] || null,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Internal server error';
+      return res.status(500).json({ error: message });
+    }
+  });
+
+  // ============================================
+  // GET /api/v2/relationships/:id/events
+  // Get events for a relationship
+  // ============================================
+  router.get('/:id/events', async (req: Request, res: Response) => {
+    try {
+      const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
+      const severity = req.query.severity as string | undefined;
+
+      let query = `SELECT * FROM relationship_events
+                   WHERE relationship_id = $1`;
+      const params: unknown[] = [req.params.id];
+
+      if (severity) {
+        query += ` AND severity = $2`;
+        params.push(severity.toUpperCase());
+      }
+
+      query += ` ORDER BY occurred_at DESC LIMIT $${params.length + 1}`;
+      params.push(limit);
+
+      const result = await db.query(query, params);
+
+      return res.json({
+        relationship_id: req.params.id,
+        events: result.rows,
+        count: result.rows.length,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Internal server error';
+      return res.status(500).json({ error: message });
+    }
+  });
+
+  // ============================================
+  // GET /api/v2/relationships/:id/alerts
+  // Get alerts for a relationship
+  // ============================================
+  router.get('/:id/alerts', async (req: Request, res: Response) => {
+    try {
+      const statusFilter = req.query.status as string || 'ACTIVE';
+
+      const result = await db.query(
+        `SELECT * FROM alerts
+         WHERE relationship_id = $1 AND status = $2
+         ORDER BY created_at DESC
+         LIMIT 50`,
+        [req.params.id, statusFilter.toUpperCase()]
+      );
+
+      return res.json({
+        relationship_id: req.params.id,
+        alerts: result.rows,
+        count: result.rows.length,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Internal server error';
+      return res.status(500).json({ error: message });
+    }
+  });
+
+  // ============================================
+  // PATCH /api/v2/relationships/:id/alerts/:alertId
+  // Acknowledge or resolve an alert
+  // ============================================
+  router.patch('/:id/alerts/:alertId', async (req: Request, res: Response) => {
+    try {
+      const { status } = req.body;
+
+      if (!['ACKNOWLEDGED', 'RESOLVED'].includes(status)) {
+        return res.status(400).json({
+          error: 'Status must be ACKNOWLEDGED or RESOLVED',
+        });
+      }
+
+      const timestampField = status === 'ACKNOWLEDGED' ? 'acknowledged_at' : 'resolved_at';
+
+      const result = await db.query(
+        `UPDATE alerts
+         SET status = $1, ${timestampField} = NOW()
+         WHERE id = $2 AND relationship_id = $3
+         RETURNING *`,
+        [status, req.params.alertId, req.params.id]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'Alert not found' });
+      }
+
+      return res.json(result.rows[0]);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Internal server error';
       return res.status(500).json({ error: message });
